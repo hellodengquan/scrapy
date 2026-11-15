@@ -420,6 +420,10 @@ feed_slot_closed
 
     Sent when a :ref:`feed exports <topics-feed-exports>` slot is closed.
 
+    The ``commit_state`` attribute of *slot* tells the outcome of its commit:
+    ``"committed"`` when the batch reached its target, ``"failed"`` when that
+    failed, and ``"staging"`` while the batch has not been stored.
+
     This signal supports :ref:`asynchronous handlers <signal-deferred>`.
 
     :param slot: the slot closed

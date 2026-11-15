@@ -95,3 +95,92 @@ def test_seen_requests_survive_kill(tmp_path: Path) -> None:
     assert len(parsed) == len(set(parsed))
     # The request being downloaded when the spider dies is lost.
     assert len(parsed) >= 19
+
+
+ATOMIC_SPIDER = """
+import os
+
+from scrapy import Request, Spider, signals
+
+
+class AtomicSpider(Spider):
+    name = "atomic"
+    custom_settings = {
+        "FEEDS": {
+            __import__("pathlib").Path(__file__).parent / "out" / "%(batch_id)d.jsonl": {
+                "format": "jsonlines",
+                "atomic": True,
+            },
+        },
+        "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+        "JOBDIR_SYNC_EVERY": 1,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scraped = 0
+
+    def item_scraped(self, item, response, spider):
+        self.scraped += 1
+        # Die right after the second item, i.e. after the first batch is full
+        # but before its close has finished.
+        if self.scraped == int(getattr(self, "kill_at", 0)):
+            os._exit(1)
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.item_scraped, signals.item_scraped)
+        return spider
+
+    async def start(self):
+        if hasattr(self, "resume"):
+            return
+        for i in range(4):
+            yield Request(f"data:,{i}")
+
+    def parse(self, response):
+        yield {"value": response.url}
+"""
+
+
+def run_atomic(tmp_path: Path, *args: str) -> str:
+    spider = tmp_path / "atomic.py"
+    spider.write_text(ATOMIC_SPIDER, encoding="utf-8")
+    _, _, log = proc(
+        "runspider",
+        str(spider),
+        "-s",
+        f"JOBDIR={tmp_path / 'job'}",
+        "--loglevel",
+        "INFO",
+        *args,
+        cwd=tmp_path,
+    )
+    return log
+
+
+def test_atomic_feed_incomplete_file_not_visible(tmp_path: Path) -> None:
+    """A killed crawl never leaves an incomplete batch at its target.
+
+    The staged file remains in place, because the killed crawl had no chance
+    to save the state that a resumed crawl needs to recover it.
+    """
+    out = tmp_path / "out"
+    run_atomic(tmp_path, "-a", "kill_at=2")
+    assert not (tmp_path / "job" / "spider.state").exists()
+    targets = [p for p in out.iterdir() if p.suffix == ".jsonl"]
+    assert targets == []
+    staged = [p for p in out.iterdir() if "part-" in p.name]
+    assert staged
+    # The staged data was not marked complete, so no later run publishes it.
+    assert not any(p.with_name(f"{p.name}.complete").exists() for p in staged)
+
+    run_atomic(tmp_path, "-a", "resume=1")
+    # Every line at a target is a complete, parseable item: the incomplete
+    # staged data of the killed run was never published.
+    for file in out.iterdir():
+        if file.suffix != ".jsonl":
+            continue
+        for line in file.read_text(encoding="utf-8").splitlines():
+            assert json.loads(line).keys() == {"value"}
