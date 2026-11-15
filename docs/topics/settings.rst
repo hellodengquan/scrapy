@@ -1298,6 +1298,15 @@ key, in which case they keep that slot.
    In earlier versions, redirects and retries always kept the slot of their
    original request, even when they pointed to a different domain.
 
+A response with a 429 or 503 status holds the whole slot for a while: its
+other requests wait instead of hitting the origin again. The delay comes from
+the ``Retry-After`` response header, when it carries one, and otherwise
+doubles with every consecutive such response, starting at 1 second and capped
+at 60 seconds. A response with any other status resets the doubling. The other
+slots keep downloading in the meantime, so a slot that backs off neither
+keeps a global download place nor starves them. The number of such responses
+is available as the :stat:`downloader/backoff_count` stat.
+
 
 .. setting:: DOWNLOAD_TIMEOUT
 

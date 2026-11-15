@@ -4,8 +4,10 @@ import asyncio
 import gc
 import random
 import warnings
+from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from functools import partial
 from logging import getLogger
 from time import monotonic, perf_counter, time
@@ -55,6 +57,15 @@ logger = getLogger(__name__)
 # survives a crawl being resumed from a disk queue.
 _DELAY_DEADLINE_META_KEY = "_delay_deadline"
 
+# HTTP statuses that ask the client to slow down. They put the whole slot on
+# hold instead of only retrying the request, so that the other requests queued
+# for the same origin do not keep hitting it.
+_BACKOFF_STATUSES = frozenset({429, 503})
+# Exponential backoff applied to a slot when a backing-off response carries no
+# Retry-After header, capped so that a failing origin is retried at all.
+_BACKOFF_BASE_DELAY = 1.0
+_BACKOFF_MAX_DELAY = 60.0
+
 
 def _start_delay_countdown(request: Request) -> None:
     """Turn the ``delay`` meta key of *request*, if any, into a deadline.
@@ -100,6 +111,11 @@ class Slot:
     # Number of requests in queue not sent with
     # ExecutionEngine.download_async().
     _scheduled_queued: int = field(default=0, init=False, repr=False)
+    # Monotonic time until which the slot sends nothing, because the origin
+    # answered with a backing-off status, and how many such answers in a row
+    # produced it.
+    backoff_until: float = field(default=0.0, init=False, repr=False)
+    backoff_attempts: int = field(default=0, init=False, repr=False)
 
     # Hand-written to accept the deprecated randomize_delay parameter, which
     # means it also has to initialize the fields above.
@@ -132,6 +148,8 @@ class Slot:
         self.lastseen = 0
         self.latercall = None
         self._scheduled_queued = 0
+        self.backoff_until = 0.0
+        self.backoff_attempts = 0
 
     @property
     def randomize_delay(self) -> bool:
@@ -273,6 +291,14 @@ class Downloader:
         # active size then, or (None, 0) if it is not holding them back.
         self._size_stall: tuple[float | None, int] = (None, 0)
         self._size_stall_warned = False
+        # Requests currently being downloaded across all slots. The total is
+        # limited by CONCURRENT_REQUESTS, unlike self.active, which also counts
+        # requests waiting for their slot's delay or backoff.
+        self._transferring_total = 0
+        # Slot key after which _process_queues() keeps looking for the next one,
+        # so that slots freed in turn take turns instead of the first slot
+        # winning every global transfer place.
+        self._last_processed_slot: str | None = None
 
     @property
     def randomize_delay(self) -> bool:
@@ -334,7 +360,11 @@ class Downloader:
         self._last_backout = (reason, current_time)
 
     def needs_backout(self) -> bool:
-        # A total concurrency of 0 means no limit.
+        # A total concurrency of 0 means no limit. The cap stays on accepted
+        # requests: one waiting for its slot delay or backoff is not
+        # transferring yet, so capping transfers alone would let the engine pull
+        # the whole scheduler queue into the downloader. The fairness between
+        # slots is enforced in _process_queues() against the transfer count.
         if 0 < self.total_concurrency <= len(self.active):
             self._record_backout("concurrency")
             return True
@@ -502,19 +532,27 @@ class Downloader:
         slot.queue.append((request, d))
         if request not in self.middleware._unscheduled_requests:
             slot._scheduled_queued += 1
-        self._process_queue(slot)
+        self._process_queues()
         try:
             return await maybe_deferred_to_future(d)  # fired in _wait_for_download()
         finally:
             slot.active.remove(request)
 
-    def _process_queue(self, slot: Slot) -> None:
+    def _process_queue(self, slot: Slot, slot_key: str | None = None) -> None:
         if slot.latercall:
             # block processing until slot.latercall is called
             return
 
-        # Delay queue processing if a download_delay is configured
         now = monotonic()
+        backoff = slot.backoff_until - now
+        if backoff > 0:
+            # The origin asked the slot to slow down. Hold every request of
+            # the slot until the backoff ends instead of letting the first one
+            # through earlier.
+            slot.latercall = call_later(backoff, self._latercall, slot)
+            return
+
+        # Delay queue processing if a download_delay is configured
         delay = slot.download_delay()
         if delay:
             penalty = delay - now + slot.lastseen
@@ -524,6 +562,10 @@ class Downloader:
 
         # Process enqueued requests if there are free slots to transfer for this slot
         while slot.queue and slot.free_transfer_slots() > 0:
+            if not self._has_free_transfer_slot():
+                # The global limit is reached. A finishing transfer calls
+                # _process_queues(), which gives this slot another turn.
+                return
             index = self._next_transfer_index(slot)
             if index is None:
                 break
@@ -533,6 +575,12 @@ class Downloader:
             # Do this immediately so that following free_transfer_slots() calls
             # account for this request.
             slot.transferring.add(request)
+            self._transferring_total += 1
+            if slot_key is not None:
+                # The next free global transfer place starts after this slot,
+                # so that the slots take turns instead of the same one taking
+                # every freed place.
+                self._last_processed_slot = slot_key
             if request in self.middleware._unscheduled_requests:
                 self._unscheduled_transfers += 1
                 self._unscheduled_rough_size += self.middleware._rough_size(request)
@@ -550,6 +598,33 @@ class Downloader:
             if delay:
                 self._process_queue(slot)
                 break
+
+    def _has_free_transfer_slot(self) -> bool:
+        return not self.total_concurrency or (
+            self._transferring_total < self.total_concurrency
+        )
+
+    def _process_queues(self) -> None:
+        """Give every slot with queued requests a turn at the global transfer
+        budget, starting after the slot last served.
+
+        A single slot can otherwise take every free global place as soon as a
+        transfer ends and leave the requests of the other slots waiting behind
+        its delay or backoff.
+        """
+        keys = [key for key, slot in self.slots.items() if slot.queue]
+        if not keys:
+            return
+        ordered = sorted(keys)
+        last = self._last_processed_slot
+        start = 0
+        if last is not None:
+            start = bisect_right(ordered, last) % len(ordered)
+        for offset in range(len(ordered)):
+            key = ordered[(start + offset) % len(ordered)]
+            self._process_queue(self.slots[key], slot_key=key)
+            if not self._has_free_transfer_slot():
+                return
 
     def _download_task_done(self, result: Any, request: Request) -> Any:
         self._download_tasks.pop(request, None)
@@ -581,6 +656,10 @@ class Downloader:
             # Counted before _end_transfer() resumes queued requests, so that
             # _next_transfer_index() accounts for it.
             self.middleware._count_response_size(response, request)
+            if response.status in _BACKOFF_STATUSES:
+                self._back_off_slot(slot, response)
+            else:
+                slot.backoff_attempts = 0
             # 2. Notify response_downloaded listeners about the recent download
             # before querying queue for next request
             self.signals.send_catch_log(
@@ -599,6 +678,51 @@ class Downloader:
             # following requests (perhaps those which came from the downloader
             # middleware itself)
             self._end_transfer(slot, request)
+
+    def _back_off_slot(self, slot: Slot, response: Response) -> None:
+        """Hold *slot* after a backing-off response (429 or 503).
+
+        A Retry-After header gives the delay directly, as seconds or an HTTP
+        date. Without one the delay grows exponentially with the consecutive
+        backing-off answers of the slot.
+        """
+        delay = self._retry_after_delay(response)
+        if delay is None:
+            delay = min(
+                _BACKOFF_MAX_DELAY,
+                _BACKOFF_BASE_DELAY * 2**slot.backoff_attempts,
+            )
+        slot.backoff_attempts += 1
+        slot.backoff_until = monotonic() + delay
+        if self._stats is not None:
+            self._stats.inc_value("downloader/backoff_count")
+        logger.debug(
+            f"Slowing down requests on slot for {delay:.2f}s after "
+            f"HTTP {response.status}"
+        )
+
+    @staticmethod
+    def _retry_after_delay(response: Response) -> float | None:
+        """Return the delay asked by the Retry-After header of *response*, or
+        None if the header is absent or cannot be parsed."""
+        value = response.headers.get("Retry-After")
+        if value is None:
+            return None
+        text = value.decode("ascii", errors="ignore").strip()
+        if not text:
+            return None
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            # An HTTP date without a timezone is not valid, so ignore it.
+            return None
+        return max(0.0, retry_at.timestamp() - time())
 
     def _add_unscheduled_request(self, request: Request) -> None:
         self.middleware._unscheduled_requests.add(request)
@@ -656,9 +780,7 @@ class Downloader:
         self._size_blocked = False
         # A slot with held-back requests may have no transfer of its own to
         # resume it.
-        for slot in list(self.slots.values()):
-            if slot.queue:
-                self._process_queue(slot)
+        self._process_queues()
 
     def _on_unscheduled_response_release(self, size: int) -> None:
         self.middleware._unscheduled_response_active_size -= size
@@ -720,11 +842,14 @@ class Downloader:
 
     def _end_transfer(self, slot: Slot, request: Request) -> None:
         slot.transferring.remove(request)
+        self._transferring_total -= 1
         unscheduled = request in self.middleware._unscheduled_requests
         if unscheduled:
             self._unscheduled_transfers -= 1
             self._unscheduled_rough_size -= self.middleware._rough_size(request)
-        self._process_queue(slot)
+        # Sweep every slot, so that a transfer of one slot frees a global place
+        # another slot was waiting for.
+        self._process_queues()
         if unscheduled:
             self._resume_size_blocked()
         self.signals.send_catch_log(

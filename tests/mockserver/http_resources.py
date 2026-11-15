@@ -238,6 +238,38 @@ class Status(LeafResource):
         return b""
 
 
+class RateLimit(LeafResource):
+    """Answer after ``delay`` seconds with the ``status`` status code, and a
+    Retry-After header set to ``retry_after`` when given.
+
+    It lets tests interleave 200, 429 and 503 answers with controlled delays
+    and backoff hints from a single endpoint.
+    """
+
+    def render_GET(self, request: Request) -> int:
+        delay = getarg(request, b"delay", 0, type_=float)
+        status = getarg(request, b"status", 200, type_=int)
+        retry_after = getarg(request, b"retry_after", None)
+        self.deferRequest(
+            request,
+            delay,
+            self._delayed_render,
+            request,
+            status,
+            retry_after,
+        )
+        return NOT_DONE_YET
+
+    def _delayed_render(
+        self, request: Request, status: int, retry_after: bytes | None
+    ) -> None:
+        if retry_after is not None:
+            request.setHeader(b"Retry-After", retry_after)
+        request.setResponseCode(status)
+        request.write(b"")
+        request.finish()
+
+
 class Raw(LeafResource):
     def render_GET(self, request: Request) -> int:
         request.startedWriting = 1

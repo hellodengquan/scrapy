@@ -11,6 +11,7 @@ from twisted.python.failure import Failure
 
 from scrapy import Request, Spider, signals
 from scrapy.core.downloader import Downloader
+from scrapy.core.downloader.handlers.base import BaseDownloadHandler
 from scrapy.core.downloader.handlers.datauri import DataURIDownloadHandler
 from scrapy.core.engine import ExecutionEngine
 from scrapy.crawler import Crawler
@@ -487,31 +488,33 @@ class TestRequestBackout:
     @coroutine_test
     async def test_concurrency(self):
 
-        class SlowDown:
-            """Downloader middleware that returns a non-instant deferred from
-            process_request, to force need_backout calls to happen at that
-            point.
+        class SlowHandler(BaseDownloadHandler):
+            """Download handler whose downloads take a moment, so that the
+            global transfer budget stays full long enough for the engine to
+            observe the concurrency backout.
 
-            The delay is deliberately non-zero so that the concurrency backout
-            state lasts a measurable amount of wall-clock time, which keeps the
-            request_backout_seconds/concurrency stat reliably above 0."""
+            Only requests actually being downloaded count toward
+            CONCURRENT_REQUESTS; requests waiting in their slot queue do not.
+            """
 
-            def process_request(self, request):
-                from twisted.internet import reactor
-
-                d: Deferred[None] = Deferred()
-                reactor.callLater(0.01, d.callback, None)
-                return d
+            async def download_request(self, request):
+                await sleep(0.02)
+                return Response(request.url)
 
         class TestSpider(Spider):
             name = "test"
             # Several start URLs so that, with CONCURRENT_REQUESTS=1, the engine
             # reliably attempts to schedule a second request while the first one
-            # is still active, which is what triggers the concurrency backout.
+            # is still downloading, which is what triggers the concurrency
+            # backout.
             start_urls = ["data:,"] * 5
             custom_settings = {
                 "CONCURRENT_REQUESTS": 1,
-                "DOWNLOADER_MIDDLEWARES": {SlowDown: 0},
+                "DOWNLOAD_HANDLERS": {"data": SlowHandler},
+                # The empty body of the default Response still reports the
+                # default 5 MB limit size, which would otherwise back out on
+                # RESPONSE_MAX_ACTIVE_SIZE instead of concurrency.
+                "RESPONSE_MAX_ACTIVE_SIZE": 0,
             }
 
             def parse(self, response):

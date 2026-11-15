@@ -148,6 +148,16 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.spidermiddlewares.depth.DepthMiddleware`.
 
+.. stat:: downloader/backoff_count
+
+``downloader/backoff_count``
+    Number of responses with a 429 or 503 status that put the download slot
+    (see :setting:`DOWNLOAD_SLOTS`) of their request on hold. Every such
+    response holds the whole slot until the Retry-After delay, or an
+    exponential backoff when the response has no Retry-After header, elapses.
+
+    Set by the :ref:`downloader <topics-architecture>`.
+
 .. stat:: downloader/exception_count
 
 ``downloader/exception_count``
