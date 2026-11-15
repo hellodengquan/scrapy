@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import shutil
 import sys
 import warnings
 from abc import ABC, abstractmethod
@@ -249,29 +250,93 @@ _WRITE_MODES: dict[str, OpenBinaryMode] = {
 }
 
 
+def _uri_to_local_path(uri: str) -> str:
+    return file_uri_to_path(uri) if uri.startswith("file:") else uri
+
+
+def _completion_marker(staging_path: str) -> Path:
+    return Path(f"{staging_path}.complete")
+
+
+def _seal_staging_file(staging_path: str) -> None:
+    """Mark the staged file at *staging_path* as complete, so that a later
+    run may publish it but never publishes a half-written one."""
+    _completion_marker(staging_path).touch()
+
+
+def _is_staging_complete(staging_path: str) -> bool:
+    return Path(staging_path).exists() and _completion_marker(staging_path).exists()
+
+
+def _discard_staging_file(staging_path: str) -> None:
+    Path(staging_path).unlink(missing_ok=True)
+    _completion_marker(staging_path).unlink(missing_ok=True)
+
+
+def _commit_staging_file(
+    staging_path: str, final_path: str, write_mode: OpenBinaryMode
+) -> None:
+    """Publish the complete feed file at *staging_path* to *final_path*.
+
+    In the ``create`` and ``overwrite`` modes the staging file is moved, so
+    *final_path* only ever appears as a complete file. In the ``append`` mode
+    the staged data is appended to *final_path* instead, which cannot be
+    atomic. If anything fails, the staging file is left in place so that the
+    commit can be retried later.
+    """
+    staging = Path(staging_path)
+    final = Path(final_path)
+    if write_mode == "ab":
+        with staging.open("rb") as source, final.open("ab") as target:
+            shutil.copyfileobj(source, target)
+        staging.unlink()
+    elif write_mode == "xb" and final.exists():
+        raise FileExistsError(final_path)
+    else:
+        staging.replace(final)
+    _completion_marker(staging_path).unlink(missing_ok=True)
+
+
 class FileFeedStorage:
     """:ref:`Local filesystem <topics-feed-storage-fs>` storage backend.
 
     *uri* may be a ``file://`` URI or a plain path. Missing parent directories
     are created when the feed is opened.
+
+    When the *atomic* feed option is enabled, items are written to a staging
+    file next to the target, and the target only receives the file once the
+    batch is complete. The staging file path is then available as
+    :attr:`staging_path`.
     """
 
     supported_modes: frozenset[str] = _FEED_MODES
 
     def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
-        self.path: str = file_uri_to_path(uri) if uri.startswith("file:") else uri
+        self.path: str = _uri_to_local_path(uri)
         self.write_mode: OpenBinaryMode = _WRITE_MODES[
             _get_mode(self, feed_options, "append")
         ]
+        self.staging_path: str | None = None
+        if (feed_options or {}).get("atomic"):
+            self.staging_path = f"{self.path}.part-{uuid4().hex}"
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
-        return Path(self.path).open(self.write_mode)
+        if self.staging_path is None:
+            return Path(self.path).open(self.write_mode)
+        if self.write_mode == "xb" and Path(self.path).exists():
+            # Report the conflict before any item is written, as the
+            # non-atomic create mode does, instead of on commit.
+            raise FileExistsError(self.path)
+        return Path(self.staging_path).open("wb")
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
         file.close()
+        if self.staging_path is not None:
+            _seal_staging_file(self.staging_path)
+            _commit_staging_file(self.staging_path, self.path, self.write_mode)
         return None
 
 
@@ -586,6 +651,71 @@ class FTPFeedStorage(BlockingFeedStorage):
         )
 
 
+class _BatchRecord:
+    """The information needed to finish exporting a batch of an atomic feed
+    whose commit did not complete during the run that created it."""
+
+    __slots__ = (
+        "batch_id",
+        "itemcount",
+        "items",
+        "slot",
+        "staging_path",
+        "storage_name",
+        "uri",
+    )
+
+    def __init__(
+        self,
+        batch_id: int,
+        uri: str,
+        staging_path: str,
+        storage_name: str,
+        *,
+        items: list[Any] | None = None,
+        itemcount: int = 0,
+        slot: FeedSlot | None = None,
+    ):
+        self.batch_id: int = batch_id
+        # The resolved feed URI of the batch, i.e. its identity: a retry
+        # commits to the same target even if the template uses batch_time.
+        self.uri: str = uri
+        self.staging_path: str = staging_path
+        self.storage_name: str = storage_name
+        # The items exported into the batch, or None when they are not
+        # tracked (see FeedSlot._pending_items).
+        self.items: list[Any] | None = items
+        # The number of items exported into the batch, which decides whether
+        # closing it stores it at all (see FeedExporter._close_slot()).
+        self.itemcount: int = itemcount
+        # The slot of the batch while the run that created it is active,
+        # whose values replace the saved ones when the state is saved.
+        self.slot: FeedSlot | None = slot
+
+    def to_state(self) -> dict[str, Any]:
+        items = self.slot._pending_items if self.slot is not None else self.items
+        itemcount = self.slot.itemcount if self.slot is not None else self.itemcount
+        return {
+            "batch_id": self.batch_id,
+            "uri": self.uri,
+            "staging": self.staging_path,
+            "storage_name": self.storage_name,
+            "itemcount": itemcount,
+            "items": list(items or ()),
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        return cls(
+            state["batch_id"],
+            state["uri"],
+            state["staging"],
+            state["storage_name"],
+            items=list(state["items"]),
+            itemcount=state["itemcount"],
+        )
+
+
 class FeedSlot:
     def __init__(
         self,
@@ -623,6 +753,21 @@ class FeedSlot:
         self._skipped: bool = False
         self._exporting: bool = False
         self._fileloaded: bool = False
+        # Whether closing this slot has been scheduled, so that a batch is not
+        # stored twice when its close is scheduled from several places.
+        self._close_scheduled: bool = False
+        # Outcome of the commit of this slot to its target: "staging" while
+        # its data has not been stored yet, "committed" once the target holds
+        # the complete batch, and "failed" when the commit failed.
+        self.commit_state: str = "staging"
+        # Items of this batch, kept only for atomic batched feeds, so that a
+        # resumed crawl can export them again if their staging data is lost.
+        self._pending_items: list[Any] | None = (
+            []
+            if feed_options.get("batch_item_count")
+            and getattr(storage, "staging_path", None) is not None
+            else None
+        )
 
     async def start_exporting(self) -> None:
         if not self._fileloaded:
@@ -685,6 +830,10 @@ class FeedExporter:
         self.filters: dict[str, ItemFilter] = {}
         self.processors: dict[str, _ItemProcessor | None] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
+        # Batches of atomic feeds that are not committed yet, per feed
+        # template, in batch order. They are saved to the spider state so
+        # that a resumed crawl can finish their export.
+        self._batch_records: dict[str, list[_BatchRecord]] = {}
         # Item export may await user-defined code (e.g. an async def
         # export_item() method), while item_scraped signals are sent
         # concurrently (see the CONCURRENT_ITEMS setting). This lock prevents
@@ -754,6 +903,17 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+            if feed_options.get("atomic") and not self._storage_is_atomic(
+                uri, feed_options
+            ):
+                storage_cls = self.storages.get(
+                    urlparse(uri).scheme, self.storages["file"]
+                )
+                logger.warning(
+                    f"The atomic feed option of the {uri} feed is only "
+                    f"supported for local file system feeds; it is ignored by "
+                    f"{getattr(storage_cls, '__name__', storage_cls)}."
+                )
 
     def open_spider(self, spider: Spider) -> None:
         self._slots_initialized = False
@@ -769,44 +929,469 @@ class FeedExporter:
                     f"function."
                 )
                 continue
-            self.slots.append(
-                self._start_new_batch(
-                    batch_id=1,
-                    uri=resolved_uri,
-                    feed_options=feed_options,
-                    spider=spider,
-                    uri_template=uri,
-                )
+            slot = self._start_new_batch(
+                batch_id=1,
+                uri=resolved_uri,
+                feed_options=feed_options,
+                spider=spider,
+                uri_template=uri,
             )
+            self.slots.append(slot)
+            self._track_batch(slot)
 
     async def _on_state_loaded(self, state: dict[str, Any]) -> None:
-        """Update initial batch-1 slots with the correct resumed batch IDs.
+        """Apply the state saved by the previous run to the initial slots.
 
         Called via the spider_state_loaded signal after SpiderState has
         populated spider.state. Safe to mutate slots here because FeedSlot
         opens its file lazily; no I/O has occurred yet.
         """
+        saved_records = {
+            uri_template: [_BatchRecord.from_state(record) for record in records]
+            for uri_template, records in state.get("feed_atomic_batches", {}).items()
+        }
+        slot_templates = {slot.uri_template for slot in self.slots}
+        # Keep the batches of the feeds that have no slot in this run, so that
+        # their export can still be retried if the feed is added back.
+        for uri_template, records in saved_records.items():
+            if uri_template not in slot_templates:
+                self._batch_records[uri_template] = records
         feed_batch_ids: dict[str, int] = state.get("feed_batch_ids", {})
-        if feed_batch_ids:
-            spider = self.crawler.spider
-            assert spider is not None
-            for slot in self.slots:
-                saved_id = feed_batch_ids.get(slot.uri_template, 0)
-                if saved_id == 0:
-                    continue
-                batch_id = saved_id
+        spider = self.crawler.spider
+        assert spider is not None
+        for index, slot in enumerate(self.slots):
+            records = saved_records.pop(slot.uri_template, [])
+            # The record of the initial batch does not apply anymore: the
+            # saved state or the recovery below replaces it.
+            self._batch_records.pop(slot.uri_template, None)
+            saved_id = feed_batch_ids.get(slot.uri_template, 0)
+            if records and getattr(slot.storage, "staging_path", None) is not None:
+                self.slots[index] = await self._recover_atomic_feed(
+                    slot, records, saved_id, spider
+                )
+                continue
+            if records:
+                # The feed is no longer atomic, so its staged data cannot be
+                # published, but leaving it behind is safer than deleting it.
+                logger.warning(
+                    f"Ignoring the unsaved batches of {slot.uri_template} from "
+                    f"the previous run: they were written to staging files, "
+                    f"which are only recovered when the atomic feed option is "
+                    f"enabled.",
+                    extra={"spider": spider},
+                )
+            if saved_id:
                 uri_params = self._get_uri_params(
                     spider, self.feeds[slot.uri_template]["uri_params"]
                 )
-                uri_params["batch_id"] = batch_id
-                uri = apply_uri_params(slot.uri_template, uri_params)
-                slot.batch_id = batch_id
-                slot.uri = uri
-                slot.storage = self._get_storage(uri, self.feeds[slot.uri_template])
+                uri_params["batch_id"] = saved_id
+                slot.batch_id = saved_id
+                slot.uri = apply_uri_params(slot.uri_template, uri_params)
+                slot.storage = self._get_storage(
+                    slot.uri, self.feeds[slot.uri_template]
+                )
+            self._track_batch(slot)
         self._slots_initialized = True
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slots_initialized, slots=self.slots
         )
+
+    async def _recover_atomic_feed(
+        self,
+        slot: FeedSlot,
+        records: list[_BatchRecord],
+        next_batch_id: int,
+        spider: Spider,
+    ) -> FeedSlot:
+        """Finish the export of the batches that the previous run left
+        uncommitted, and return the slot that this run continues with.
+
+        *next_batch_id* is the batch that the previous run saved for this
+        feed: the batch that was in progress, or the following one if it was
+        stored.
+        """
+        feed_options = self.feeds[slot.uri_template]
+        write_mode = _WRITE_MODES[_get_mode(slot.storage, feed_options, "append")]
+        if next_batch_id < 1:
+            next_batch_id = max(record.batch_id for record in records)
+        closed_records = [
+            record for record in records if record.batch_id < next_batch_id
+        ]
+        for record in closed_records:
+            await self._recover_closed_batch(
+                slot.uri_template, record, feed_options, write_mode, spider
+            )
+        open_record = next(
+            (record for record in records if record.batch_id == next_batch_id), None
+        )
+        if open_record is None:
+            # The batch in progress reached its target or was not stored, so
+            # this run starts a new batch.
+            self._set_slot_batch(slot, next_batch_id, spider)
+            return slot
+        return await self._recover_open_batch(
+            slot, open_record, feed_options, write_mode, spider
+        )
+
+    async def _recover_closed_batch(
+        self,
+        uri_template: str,
+        record: _BatchRecord,
+        feed_options: dict[str, Any],
+        write_mode: OpenBinaryMode,
+        spider: Spider,
+    ) -> None:
+        """Publish a batch that was complete but not committed when the
+        previous run saved its state, or export its items again if the
+        previous run did not finish writing it."""
+        if _is_staging_complete(record.staging_path):
+            if self._publish_record(record, write_mode, spider) == "failed":
+                self._keep_record(uri_template, record)
+            return
+        if not Path(record.staging_path).exists():  # noqa: ASYNC240
+            if Path(_uri_to_local_path(record.uri)).exists():  # noqa: ASYNC240
+                # The batch reached its target already.
+                return
+            if not record.items:
+                # Its staged data is gone and it cannot be written again.
+                return
+            # The staged data was discarded after a failed re-export, so
+            # write the batch again from its saved items.
+        else:
+            # The previous run stopped while writing the batch, so the staged
+            # data is incomplete and must not be published.
+            _discard_staging_file(record.staging_path)
+            if not record.items:
+                logger.warning(
+                    f"Cannot recover the batch of {record.uri} from the "
+                    f"previous run: its staged data was incomplete and its "
+                    f"items were not saved.",
+                    extra={"spider": spider},
+                )
+                return
+        retry_record = await self._export_record_again(
+            uri_template, record, feed_options, spider
+        )
+        if retry_record is not None:
+            self._keep_record(uri_template, retry_record)
+
+    async def _recover_open_batch(
+        self,
+        slot: FeedSlot,
+        record: _BatchRecord,
+        feed_options: dict[str, Any],
+        write_mode: OpenBinaryMode,
+        spider: Spider,
+    ) -> FeedSlot:
+        """Publish the data of *record* or export its items again as needed,
+        and point *slot* at the batch that this run continues with."""
+        if not feed_options["batch_item_count"]:
+            # A feed without batches writes its whole output into a single
+            # target, and the resumed run writes it again from scratch, so the
+            # staged data of the previous run cannot be recovered.
+            _discard_staging_file(record.staging_path)
+            logger.warning(
+                f"Cannot recover the feed {record.uri} from the previous run: "
+                f"a feed without batches is written again from scratch when "
+                f"the crawl is resumed.",
+                extra={"spider": spider},
+            )
+            self._set_slot_batch(slot, record.batch_id, spider)
+            return slot
+        uri_template = slot.uri_template
+        next_batch_id = record.batch_id + 1
+        if _is_staging_complete(record.staging_path):
+            # The batch was written completely, but its commit did not finish.
+            if self._publish_record(record, write_mode, spider) == "failed":
+                self._keep_record(uri_template, record)
+            self._set_slot_batch(slot, next_batch_id, spider)
+            return slot
+        if Path(record.staging_path).exists():  # noqa: ASYNC240
+            # The previous run stopped while writing the batch, so the staged
+            # data is incomplete and must not be published.
+            _discard_staging_file(record.staging_path)
+            if not record.items:
+                if (
+                    feed_options["store_empty"]
+                    and record.batch_id == 1
+                    # The empty first batch may have been stored before the
+                    # crawl was interrupted; keeping its identity could then
+                    # conflict with its own target.
+                    and Path(_uri_to_local_path(record.uri)).exists()  # noqa: ASYNC240
+                ):
+                    self._set_slot_batch(slot, next_batch_id, spider)
+                    return slot
+                # Nothing was exported into the batch, so it can be reused.
+                self._set_slot_batch(slot, record.batch_id, spider)
+                return slot
+            return await self._resume_batch(slot, record, spider)
+        # The staged data is gone: the batch either reached its target after
+        # the state was saved, or its data was lost.
+        if Path(_uri_to_local_path(record.uri)).exists():  # noqa: ASYNC240
+            self._set_slot_batch(slot, next_batch_id, spider)
+            return slot
+        if not record.items:
+            self._set_slot_batch(slot, record.batch_id, spider)
+            return slot
+        return await self._resume_batch(slot, record, spider)
+
+    async def _resume_batch(
+        self, slot: FeedSlot, record: _BatchRecord, spider: Spider
+    ) -> FeedSlot:
+        """Export the items of *record* again into a batch with its identity,
+        and return the slot that the following items go into."""
+        slot.batch_id = record.batch_id
+        slot.uri = record.uri
+        slot.storage = self._get_storage(slot.uri, self.feeds[slot.uri_template])
+        items = record.items or []
+        # The items of the previous run are already part of the batch, and the
+        # items of this run extend it.
+        slot._pending_items = list(items)
+        self._track_batch(slot)
+        try:
+            await self._export_items(slot, items)
+        except FileExistsError:
+            # The target appeared after the previous run saved its state, so
+            # this batch cannot be written again in the create mode.
+            staging_path = cast("str", getattr(slot.storage, "staging_path", None))
+            _discard_staging_file(staging_path)
+            logger.error(
+                f"Not writing {slot.uri} because it already exists and the "
+                f"feed mode is 'create'; the recovered items of the batch are "
+                f"lost.",
+                extra={"spider": spider},
+            )
+            assert self.crawler.stats
+            self.crawler.stats.inc_value(f"feedexport/conflicts/{record.storage_name}")
+            self._untrack_batch(slot)
+            self._set_slot_batch(slot, record.batch_id + 1, spider)
+            return slot
+        except Exception:
+            # Keep the record so that a later run can export the items again,
+            # and let the items of this run go into a fresh batch of the same
+            # feed.
+            logger.exception(
+                f"Error exporting the recovered items of {record.uri}; they "
+                f"will be exported again when the crawl is resumed again.",
+                extra={"spider": spider},
+            )
+            self._reset_slot(slot)
+            self._keep_record(slot.uri_template, record)
+            self._set_slot_batch(slot, record.batch_id + 1, spider)
+            return slot
+        slot.itemcount = len(items)
+        batch_item_count = self.feeds[slot.uri_template]["batch_item_count"]
+        if slot.itemcount < batch_item_count:
+            return slot
+        # The batch is full again, so this run continues with the next one.
+        next_slot = self._next_batch_slot(slot, spider)
+        self._schedule_slot_close(slot, spider)
+        self._track_batch(next_slot)
+        return next_slot
+
+    @staticmethod
+    def _close_slot_file(slot: FeedSlot) -> None:
+        """Close the file of *slot*, if any, ignoring errors."""
+        if slot.file is not None:
+            with contextlib.suppress(Exception):
+                slot.file.close()
+            slot.file = None
+
+    def _reset_slot(self, slot: FeedSlot) -> None:
+        """Close the partly written staging file of *slot* and reset its
+        export state, so that it can export a new batch."""
+        staging_path = cast("str", getattr(slot.storage, "staging_path", None))
+        self._close_slot_file(slot)
+        _discard_staging_file(staging_path)
+        slot.exporter = None
+        slot._exporting = False
+        slot._fileloaded = False
+        slot._skipped = False
+        slot.itemcount = 0
+        self._untrack_batch(slot)
+        slot._pending_items = []
+
+    def _next_batch_slot(self, slot: FeedSlot, spider: Spider) -> FeedSlot:
+        feed_options = self.feeds[slot.uri_template]
+        uri_params = self._get_uri_params(spider, feed_options["uri_params"], slot)
+        return self._start_new_batch(
+            batch_id=slot.batch_id + 1,
+            uri=apply_uri_params(slot.uri_template, uri_params),
+            feed_options=feed_options,
+            spider=spider,
+            uri_template=slot.uri_template,
+        )
+
+    def _set_slot_batch(self, slot: FeedSlot, batch_id: int, spider: Spider) -> None:
+        """Make *slot* export the batch *batch_id* of its feed, starting from
+        a clean staging file, and track it."""
+        feed_options = self.feeds[slot.uri_template]
+        uri_params = self._get_uri_params(spider, feed_options["uri_params"])
+        uri_params["batch_id"] = batch_id
+        slot.batch_id = batch_id
+        slot.uri = apply_uri_params(slot.uri_template, uri_params)
+        slot.storage = self._get_storage(slot.uri, feed_options)
+        self._track_batch(slot)
+
+    async def _export_record_again(
+        self,
+        uri_template: str,
+        record: _BatchRecord,
+        feed_options: dict[str, Any],
+        spider: Spider,
+    ) -> _BatchRecord | None:
+        """Export the items of the complete batch *record* into a new file
+        with the identity of *record*, and publish it.
+
+        Return a record to retry on a later run if the commit fails, or None.
+        """
+        slot = self._start_new_batch(
+            batch_id=record.batch_id,
+            uri=record.uri,
+            feed_options=feed_options,
+            spider=spider,
+            uri_template=uri_template,
+        )
+        items = record.items or []
+        staging_path = cast("str", getattr(slot.storage, "staging_path", None))
+        try:
+            await self._export_items(slot, items)
+        except Exception:
+            # Close the partly written file and keep the record so that a
+            # later run can export the items again.
+            self._close_slot_file(slot)
+            _discard_staging_file(staging_path)
+            logger.exception(
+                f"Error exporting the recovered items of {record.uri}; they "
+                f"will be exported again when the crawl is resumed again.",
+                extra={"spider": spider},
+            )
+            assert self.crawler.stats
+            self.crawler.stats.inc_value(
+                f"feedexport/failed_count/{record.storage_name}"
+            )
+            return record
+        slot.itemcount = len(items)
+        await slot.finish_exporting()
+        assert self.crawler.stats
+        self.crawler.stats.inc_value(
+            f"feedexport/item_count/{record.storage_name}", slot.itemcount
+        )
+        try:
+            await ensure_awaitable(slot.storage.store(self._get_file(slot)))
+        except FileExistsError:
+            _discard_staging_file(staging_path)
+            self.crawler.stats.inc_value(f"feedexport/conflicts/{record.storage_name}")
+            logger.error(
+                f"Discarding the staged data of {record.uri}: the target "
+                f"already exists and the feed mode is 'create'.",
+                extra={"spider": spider},
+            )
+            return None
+        except Exception:
+            logger.exception(
+                f"Error storing the recovered feed {record.uri}; it will be "
+                f"retried when the crawl is resumed again.",
+                extra={"spider": spider},
+            )
+            self.crawler.stats.inc_value(
+                f"feedexport/failed_count/{record.storage_name}"
+            )
+            return _BatchRecord(
+                record.batch_id,
+                record.uri,
+                staging_path,
+                record.storage_name,
+                itemcount=slot.itemcount,
+                items=items,
+            )
+        self.crawler.stats.inc_value(f"feedexport/success_count/{record.storage_name}")
+        logger.info(f"Stored the recovered feed {record.uri}", extra={"spider": spider})
+        return None
+
+    async def _export_items(self, slot: FeedSlot, items: list[Any]) -> None:
+        await slot.start_exporting()
+        assert slot.exporter
+        for item in items:
+            await _maybe_coroutine(slot.exporter.export_item, item)
+
+    def _publish_record(
+        self, record: _BatchRecord, write_mode: OpenBinaryMode, spider: Spider
+    ) -> str:
+        """Publish the complete staged data of *record* to its target.
+
+        Return ``"committed"``, ``"failed"`` if the commit may be retried on a
+        later run, or ``"conflict"`` if the target already exists in the
+        ``create`` mode, in which case the staged data is discarded.
+        """
+        storage_name = record.storage_name
+        assert self.crawler.stats
+        try:
+            _commit_staging_file(
+                record.staging_path, _uri_to_local_path(record.uri), write_mode
+            )
+        except FileExistsError:
+            _discard_staging_file(record.staging_path)
+            self.crawler.stats.inc_value(f"feedexport/conflicts/{storage_name}")
+            logger.error(
+                f"Discarding the staged data of {record.uri} "
+                f"({record.staging_path}): the target already exists and the "
+                f"feed mode is 'create'.",
+                extra={"spider": spider},
+            )
+            return "conflict"
+        except Exception:
+            logger.exception(
+                f"Error committing the staged data of {record.uri} "
+                f"({record.staging_path}); it will be retried when the crawl "
+                f"is resumed again.",
+                extra={"spider": spider},
+            )
+            self.crawler.stats.inc_value(f"feedexport/failed_count/{storage_name}")
+            return "failed"
+        self.crawler.stats.inc_value(f"feedexport/success_count/{storage_name}")
+        logger.info(f"Stored the recovered feed {record.uri}", extra={"spider": spider})
+        return "committed"
+
+    def _track_batch(self, slot: FeedSlot) -> None:
+        """Keep what is needed to finish exporting the batch of *slot* if this
+        run ends before its commit does."""
+        staging_path = getattr(slot.storage, "staging_path", None)
+        if staging_path is None:
+            return
+        records = self._batch_records.setdefault(slot.uri_template, [])
+        if any(record.staging_path == staging_path for record in records):
+            return
+        records.append(
+            _BatchRecord(
+                slot.batch_id,
+                slot.uri,
+                staging_path,
+                self._storage_name(slot.uri),
+                itemcount=slot.itemcount,
+                items=slot._pending_items,
+                slot=slot,
+            )
+        )
+
+    def _keep_record(self, uri_template: str, record: _BatchRecord) -> None:
+        self._batch_records.setdefault(uri_template, []).append(record)
+
+    def _untrack_batch(self, slot: FeedSlot) -> None:
+        """Forget about the batch of *slot*, which cannot be recovered."""
+        staging_path = getattr(slot.storage, "staging_path", None)
+        records = self._batch_records.get(slot.uri_template)
+        if staging_path is None or not records:
+            return
+        remaining = [r for r in records if r.staging_path != staging_path]
+        if remaining:
+            self._batch_records[slot.uri_template] = remaining
+        else:
+            del self._batch_records[slot.uri_template]
+
+    def _storage_name(self, uri: str) -> str:
+        cls = self.storages.get(urlparse(uri).scheme, self.storages["file"])
+        return getattr(cls, "__name__", str(cls))
 
     async def _on_engine_started(self) -> None:
         if not self._slots_initialized:
@@ -815,15 +1400,43 @@ class FeedExporter:
                 signals.feed_slots_initialized, slots=self.slots
             )
 
-    def _on_state_saving(self, state: dict[str, Any]) -> None:
+    async def _on_state_saving(self, state: dict[str, Any]) -> None:
         """Persist the current batch ID for each feed into spider.state.
 
         Called via the spider_state_saving signal before SpiderState writes
         spider.state to disk, so the next run can resume from the right batch.
+        Also persists, for atomic feeds, the batches whose commit is still
+        pending, so that the next run can finish exporting them.
         """
+        # The spider_closed handlers run concurrently, so commits that
+        # close_spider() started may still be running. Waiting for them keeps
+        # the saved batch IDs and the saved staged data in line with the
+        # batches that were actually stored.
+        await self._wait_for_pending_closes()
         feed_batch_ids = state.setdefault("feed_batch_ids", {})
         for slot in self.slots:
-            feed_batch_ids[slot.uri_template] = slot.batch_id
+            batch_id = slot.batch_id
+            if (
+                getattr(slot.storage, "staging_path", None) is not None
+                and slot.commit_state == "committed"
+            ):
+                # The batch was stored, so the next run starts with the
+                # following one instead of writing it again. Only atomic
+                # feeds need this: other feeds keep the historical behavior.
+                batch_id += 1
+            feed_batch_ids[slot.uri_template] = batch_id
+        records = {
+            uri_template: [
+                record.to_state()
+                for record in sorted(batch_records, key=lambda r: r.batch_id)
+            ]
+            for uri_template, batch_records in self._batch_records.items()
+            if batch_records
+        }
+        if records:
+            state["feed_atomic_batches"] = records
+        else:
+            state.pop("feed_atomic_batches", None)
 
     def _skip(self, slot: FeedSlot) -> None:
         """Report that the target of *slot* already exists, and mark *slot* so
@@ -842,10 +1455,20 @@ class FeedExporter:
         )
 
     async def close_spider(self, spider: Spider) -> None:
+        await self._settle_slots(spider)
+
+        # Send FEED_EXPORTER_CLOSED signal
+        await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
+
+    async def _settle_slots(self, spider: Spider) -> None:
+        """Close every slot that is not closed yet and wait for all the
+        closes, including those started when a batch filled up."""
         for slot in self.slots:
             self._schedule_slot_close(slot, spider)
+        await self._wait_for_pending_closes()
 
-        if self._pending_close_tasks:  # pragma: no branch
+    async def _wait_for_pending_closes(self) -> None:
+        if self._pending_close_tasks:
             if is_asyncio_available():
                 await asyncio.wait(
                     cast("list[asyncio.Task[None]]", list(self._pending_close_tasks))
@@ -855,15 +1478,20 @@ class FeedExporter:
                     cast("list[Deferred[None]]", list(self._pending_close_tasks))
                 )
 
-        # Send FEED_EXPORTER_CLOSED signal
-        await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
-
     def _schedule_slot_close(
         self, slot: FeedSlot, spider: Spider
-    ) -> asyncio.Task[None] | Deferred[None]:
+    ) -> asyncio.Task[None] | Deferred[None] | None:
         """Start closing the slot without waiting for it to finish, keeping
         track of the pending work so that it can be awaited in
-        :meth:`close_spider` if it hasn't finished by then."""
+        :meth:`_settle_slots` if it hasn't finished by then.
+
+        Closing the same slot more than once has no effect, so that the
+        concurrent handlers of :signal:`spider_closed` do not store a batch
+        twice.
+        """
+        if slot._close_scheduled:
+            return None
+        slot._close_scheduled = True
         aw: asyncio.Task[None] | Deferred[None]
         coro = self._close_slot(slot, spider)
         if is_asyncio_available():
@@ -890,43 +1518,74 @@ class FeedExporter:
 
     async def _close_slot(self, slot: FeedSlot, spider: Spider) -> None:
         if slot._skipped:
+            self._untrack_batch(slot)
             return
 
-        if slot.itemcount:
-            # Normal case
-            await slot.finish_exporting()
-        elif slot.store_empty and slot.batch_id == 1:
-            # Need to store the empty file
-            await slot.start_exporting()
-            await slot.finish_exporting()
-        else:
+        if not slot.itemcount and not (slot.store_empty and slot.batch_id == 1):
             # In this case, the file is not stored, so no processing is required.
+            self._untrack_batch(slot)
             return
 
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
         slot_type = type(slot.storage).__name__
-        self.crawler.stats.inc_value(
-            f"feedexport/item_count/{slot_type}", slot.itemcount
-        )
+        staging_path = getattr(slot.storage, "staging_path", None)
         try:
-            await ensure_awaitable(slot.storage.store(self._get_file(slot)))
-        except FileExistsError:
-            self._skip(slot)
-            self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            await self._finish_exporting(slot)
         except Exception:
-            logger.exception(
-                "Error storing %s",
-                logmsg,
-                extra={"spider": spider},
-            )
+            if staging_path is None:
+                raise
+            # For atomic feeds the export must not abort the close, so that
+            # the staged file, which lacks a completion marker, is left for a
+            # later run to replace.
+            slot.commit_state = "failed"
+            self._close_slot_file(slot)
+            logger.exception("Error finishing %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
         else:
-            logger.info("Stored %s", logmsg, extra={"spider": spider})
-            self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+            self.crawler.stats.inc_value(
+                f"feedexport/item_count/{slot_type}", slot.itemcount
+            )
+            try:
+                await ensure_awaitable(slot.storage.store(self._get_file(slot)))
+            except FileExistsError:
+                slot.commit_state = "failed"
+                # The staged data cannot be published, so there is nothing to
+                # recover.
+                if staging_path is not None:
+                    _discard_staging_file(staging_path)
+                self._skip(slot)
+                self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+                self._untrack_batch(slot)
+            except Exception:
+                slot.commit_state = "failed"
+                if staging_path is not None:
+                    # The staged file holds the complete batch, and its record
+                    # keeps the batch identity, so a later run can publish it.
+                    logmsg += f" (staged in: {staging_path})"
+                logger.exception(
+                    "Error storing %s",
+                    logmsg,
+                    extra={"spider": spider},
+                )
+                self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            else:
+                slot.commit_state = "committed"
+                logger.info("Stored %s", logmsg, extra={"spider": spider})
+                self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+                self._untrack_batch(slot)
 
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
         )
+
+    async def _finish_exporting(self, slot: FeedSlot) -> None:
+        if slot.itemcount:
+            # Normal case
+            await slot.finish_exporting()
+        else:
+            # Need to store the empty file
+            await slot.start_exporting()
+            await slot.finish_exporting()
 
     def _start_new_batch(
         self,
@@ -995,6 +1654,10 @@ class FeedExporter:
                     except Exception as e:
                         e.add_note(f"Item: {exported_item!r}")
                         raise
+                    if slot._pending_items is not None:
+                        # Keep the item so that a resumed crawl can export it
+                        # again if the batch never reaches its target.
+                        slot._pending_items.append(exported_item)
                 # Skipped items are counted, so that the following files of
                 # this feed still cover the same items as those of any other
                 # feed.
@@ -1005,17 +1668,9 @@ class FeedExporter:
                     and slot.itemcount
                     >= self.feeds[slot.uri_template]["batch_item_count"]
                 ):
-                    uri_params = self._get_uri_params(
-                        spider, self.feeds[slot.uri_template]["uri_params"], slot
-                    )
                     self._schedule_slot_close(slot, spider)
-                    slot = self._start_new_batch(  # noqa: PLW2901
-                        batch_id=slot.batch_id + 1,
-                        uri=apply_uri_params(slot.uri_template, uri_params),
-                        feed_options=self.feeds[slot.uri_template],
-                        spider=spider,
-                        uri_template=slot.uri_template,
-                    )
+                    slot = self._next_batch_slot(slot, spider)  # noqa: PLW2901
+                    self._track_batch(slot)
             slots.append(slot)
         self.slots = slots
 
@@ -1091,6 +1746,16 @@ class FeedExporter:
             )
             return
         _check_mode(mode, storage, uri)
+
+    def _storage_is_atomic(self, uri: str, feed_options: dict[str, Any]) -> bool:
+        """Return whether the storage of *uri* supports the atomic feed
+        option.
+
+        Only local file feeds are atomic, including custom storages derived
+        from :class:`FileFeedStorage`.
+        """
+        cls = self.storages.get(urlparse(uri).scheme, self.storages["file"])
+        return isinstance(cls, type) and issubclass(cls, FileFeedStorage)
 
     def _get_storage(
         self, uri: str, feed_options: dict[str, Any]

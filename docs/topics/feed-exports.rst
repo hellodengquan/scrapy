@@ -171,6 +171,9 @@ specify a path (e.g. ``/tmp/export.csv``). Alternatively, you can use a
 Supported :ref:`modes <feed-mode>`: ``"append"``, ``"create"`` and
 ``"overwrite"``. If :setting:`FEED_MODE` is ``None``, ``"append"`` is used.
 
+Supports :ref:`atomic commits <atomic-commits>` through the ``atomic``
+:ref:`feed option <feed-options>`.
+
 .. _topics-feed-storage-ftp:
 .. _feed-storage-ftp:
 
@@ -337,6 +340,48 @@ backends, use :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` to split the output items
 in multiple files, with the specified maximum item count per file. That way, as
 soon as a file reaches the maximum item count, that file is delivered to the
 feed URI, allowing item delivery to start way before the end of the crawl.
+
+
+.. _atomic-commits:
+
+Atomic commits
+--------------
+
+.. versionadded:: VERSION
+
+By default, a feed is written directly at its target path, so a partial file is
+visible there while the current batch is being written, and stays behind if the
+crawl stops before the batch is complete.
+
+Enable the ``atomic`` :ref:`feed option <feed-options>` for a :ref:`local
+filesystem <topics-feed-storage-fs>` feed to write each batch to a staging file
+next to the target instead, such as
+:file:`<target>.part-<random suffix>`, and to move it to the target only once
+the batch is complete. The target path then only ever contains complete,
+parseable files. With the ``append`` :ref:`mode <feed-mode>` the staged data is
+appended to the target, which cannot be atomic.
+
+If the commit of a batch fails, its staging file is kept, the failure is logged
+with the path of that file, and the ``commit_state`` attribute of the slot that
+:signal:`feed_slot_closed` handlers receive tells the outcome: ``"staging"``
+while the batch is not stored, ``"committed"`` once the target holds the
+complete batch, or ``"failed"``. The
+``feedexport/success_count/<storage class>`` and
+``feedexport/failed_count/<storage class>`` stats only count actual commit
+outcomes, and the batches of other feeds are not affected.
+
+When the crawl is :ref:`resumed <topics-jobs>`, a batch that was complete but
+not committed is committed again under its original identity, and a batch that
+was interrupted while being written is written again from its saved items,
+also under its original identity. Committed batches keep their content and the
+crawl continues with the following batch, so no item is lost or committed
+twice. A feed without batches, i.e. without
+:setting:`FEED_EXPORT_BATCH_ITEM_COUNT`, is written again from scratch when the
+crawl is resumed.
+
+.. note:: Recovering a batch requires its items, so with a :ref:`job directory
+    <topics-jobs>` up to :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` items per feed
+    are kept in the spider state, and items must be picklable.
 
 
 .. _topics-feed-storage-custom:
@@ -527,6 +572,7 @@ These are the settings used for configuring the feed exports:
 -   :setting:`FEED_STORAGE_FTP_ACTIVE`
 -   :setting:`FEED_STORAGE_S3_ACL`
 -   :setting:`FEED_EXPORTERS`
+-   :setting:`FEED_EXPORT_ATOMIC`
 -   :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`
 -   :setting:`UPLOAD_TIMEOUT`
 
@@ -592,6 +638,13 @@ as a fallback value if that key is not provided for a specific feed definition:
 
 -   ``batch_item_count``: falls back to
     :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`.
+
+-   ``atomic``: falls back to :setting:`FEED_EXPORT_ATOMIC`.
+
+    .. versionadded:: VERSION
+
+    Only :ref:`local filesystem <topics-feed-storage-fs>` feeds support it;
+    other feeds ignore it and log a warning.
 
 -   ``encoding``: falls back to :setting:`FEED_EXPORT_ENCODING`.
 
@@ -825,6 +878,21 @@ format in :setting:`FEED_EXPORTERS`. E.g., to disable the built-in CSV exporter
         "csv": None,
     }
 
+
+.. setting:: FEED_EXPORT_ATOMIC
+
+FEED_EXPORT_ATOMIC
+------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Whether :ref:`local filesystem <topics-feed-storage-fs>` feeds use
+:ref:`atomic commits <atomic-commits>`, so that their target path only ever
+contains complete files.
+
+Can be overridden with the ``atomic`` :ref:`feed option <feed-options>`.
 
 .. setting:: FEED_EXPORT_BATCH_ITEM_COUNT
 
