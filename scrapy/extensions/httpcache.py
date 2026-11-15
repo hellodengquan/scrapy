@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import gzip
 import logging
+import os
 import pickle
+import tempfile
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from importlib import import_module
@@ -21,7 +24,6 @@ from scrapy.utils.python import to_unicode
 from scrapy.utils.response import response_from_dict
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Callable
     from types import ModuleType
 
@@ -304,14 +306,17 @@ class DbmCacheStorage:
         key = self._fingerprinter.fingerprint(request).hex()
         db = self.db
         tkey = f"{key}_time"
-        if tkey not in db:
+        dkey = f"{key}_data"
+        # The time key is written last, so a missing time or data key means the
+        # entry was never fully written and is treated as a cache miss.
+        if tkey not in db or dkey not in db:
             return None  # not found
 
         ts = float(db[tkey])
         if 0 < self.expiration_secs < time() - ts:
             return None  # expired
 
-        data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+        data = cast("dict[str, Any]", pickle.loads(db[dkey]))  # noqa: S301
         return data, ts
 
 
@@ -368,8 +373,12 @@ class FilesystemCacheStorage:
     ) -> None:
         """Store the given response in the cache."""
         rpath = Path(self._get_request_path(spider, request))
-        if not rpath.exists():
-            rpath.mkdir(parents=True)
+        rpath.mkdir(parents=True, exist_ok=True)
+        data = {
+            key: value
+            for key, value in response.to_dict().items()
+            if key not in {"url", "status", "headers", "body"}
+        }
         metadata = {
             "url": request.url,
             "method": request.method,
@@ -377,25 +386,35 @@ class FilesystemCacheStorage:
             "response_url": response.url,
             "timestamp": time(),
         }
-        with self._open(rpath / "meta", "wb") as f:
-            f.write(repr(metadata).encode())
-        with self._open(rpath / "pickled_meta", "wb") as f:
-            pickle.dump(metadata, f, protocol=4)
-        with self._open(rpath / "response_headers", "wb") as f:
-            f.write(response.headers.to_string())
-        with self._open(rpath / "response_body", "wb") as f:
-            f.write(response.body)
-        data = {
-            key: value
-            for key, value in response.to_dict().items()
-            if key not in {"url", "status", "headers", "body"}
-        }
-        with self._open(rpath / "response_data", "wb") as f:
-            pickle.dump(data, f, protocol=4)
-        with self._open(rpath / "request_headers", "wb") as f:
-            f.write(request.headers.to_string())
-        with self._open(rpath / "request_body", "wb") as f:
-            f.write(request.body)
+        # Write every payload file first and the metadata files last. The
+        # metadata, which is the only thing retrieve_response() needs to consider
+        # an entry present, thus never points at a half-written entry. Each file
+        # is also replaced atomically, so a crash leaves either the old or the
+        # new version of it, never a truncated one.
+        self._write_file(rpath / "response_headers", response.headers.to_string())
+        self._write_file(rpath / "response_body", response.body)
+        self._write_file(rpath / "response_data", pickle.dumps(data, protocol=4))
+        self._write_file(rpath / "request_headers", request.headers.to_string())
+        self._write_file(rpath / "request_body", request.body)
+        self._write_file(rpath / "meta", repr(metadata).encode())
+        self._write_file(rpath / "pickled_meta", pickle.dumps(metadata, protocol=4))
+
+    def _write_file(self, path: Path, data: bytes) -> None:
+        """Write *data* to *path* atomically, so a concurrent reader or a crash
+        never observes a partially written cache file."""
+        fd, tmp = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        os.close(fd)
+        tmp_path = Path(tmp)
+        try:
+            with self._open(tmp, "wb") as f:
+                f.write(data)
+            tmp_path.replace(path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
 
     def _get_request_path(self, spider: Spider, request: Request) -> str:
         key = self._fingerprinter.fingerprint(request).hex()

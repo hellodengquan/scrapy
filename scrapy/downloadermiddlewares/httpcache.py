@@ -250,6 +250,18 @@ class HttpCacheMiddleware:
     def _cache_response(self, response: Response, request: Request) -> None:
         if self.policy.should_cache_response(response, request):
             self.stats.inc_value("httpcache/store")
-            self.storage.store_response(self.crawler.spider, request, response)
+            try:
+                self.storage.store_response(self.crawler.spider, request, response)
+            except Exception:
+                # The cache is only a performance layer: a storage failure must
+                # not keep the complete response from reaching the spider. The
+                # failed entry is read back as a miss and re-downloaded later.
+                self.stats.inc_value("httpcache/store_error")
+                logger.warning(
+                    f"Could not store the response of {request} in the cache, "
+                    f"the response is still passed on.",
+                    exc_info=True,
+                    extra={"spider": self.crawler.spider},
+                )
         else:
             self.stats.inc_value("httpcache/uncacheable")

@@ -193,6 +193,60 @@ class StorageTestMixin(TestBase):
             assert mw.crawler.stats.get_value("httpcache/retrieve_error") == 1
             assert mw.crawler.stats.get_value("httpcache/ignore") == 1
 
+    @coroutine_test
+    async def test_store_failure_keeps_the_response_and_is_isolated(self, caplog):
+        response = Response(
+            self.request.url,
+            headers={"Expires": self.tomorrow},
+            body=b"test body",
+        )
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            other_request = Request("http://www.example.com/other")
+            other_response = Response(other_request.url, body=b"other body")
+
+            with mock.patch.object(
+                mw.storage, "store_response", side_effect=OSError("disk full")
+            ):
+                caplog.clear()
+                with caplog.at_level(logging.WARNING):
+                    result = mw.process_response(self.request, response)
+
+            assert result is response
+            assert mw.crawler.stats.get_value("httpcache/store_error") == 1
+            assert "the response is still passed on" in caplog.text
+
+            # The failure of one request key does not affect another key.
+            mw.storage.store_response(spider, other_request, other_response)
+            cached_other = mw.storage.retrieve_response(spider, other_request)
+            self.assertEqualResponse(other_response, cached_other)
+
+    @coroutine_test
+    async def test_corrupted_entry_is_replaced_after_revalidation(self):
+        response = Response(
+            self.request.url,
+            headers={"Expires": self.tomorrow},
+            body=b"test body",
+        )
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            mw.storage.store_response(spider, self.request, response)
+            self._corrupt_cache_entry(mw.storage, spider, self.request)
+
+            # The corrupted entry is treated as a miss and re-downloaded.
+            assert await mw.process_request(self.request) is None
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
+
+            # Storing the full response makes the next request a cache hit.
+            result = mw.process_response(self.request, response)
+            assert result is response
+            cached = await mw.process_request(self.request.copy())
+            assert isinstance(cached, Response)
+            assert "cached" in cached.flags
+            self.assertEqualResponse(response, cached)
+
     def test_storage_no_content_type_header(self):
         """Test that the response body is used to get the right response class
         even if there is no Content-Type header"""
@@ -866,6 +920,100 @@ class FilesystemStorageTestMixin(StorageTestMixin):
         rpath = Path(storage._get_request_path(spider, request))
         (rpath / "response_data").unlink()
 
+    @coroutine_test
+    async def test_missing_meta_is_a_plain_miss(self):
+        # The metadata file marks an entry as present; without it the entry
+        # reads as "not cached", which is not counted as a retrieval error.
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            mw.storage.store_response(spider, self.request, self.response)
+            Path(
+                mw.storage._get_request_path(spider, self.request), "pickled_meta"
+            ).unlink()
+
+            assert await mw.process_request(self.request) is None
+            assert mw.crawler.stats.get_value("httpcache/retrieve_error") is None
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
+
+    @pytest.mark.parametrize("filename", ["response_body", "response_headers"])
+    @coroutine_test
+    async def test_missing_cache_file_is_a_miss(self, filename: str):
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            mw.storage.store_response(spider, self.request, self.response)
+            Path(mw.storage._get_request_path(spider, self.request), filename).unlink()
+
+            assert await mw.process_request(self.request) is None
+            assert mw.crawler.stats.get_value("httpcache/retrieve_error") == 1
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
+
+    @pytest.mark.parametrize("filename", ["pickled_meta", "response_data"])
+    @coroutine_test
+    async def test_unpicklable_cache_file_is_a_miss(self, filename: str):
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            mw.storage.store_response(spider, self.request, self.response)
+            rpath = Path(mw.storage._get_request_path(spider, self.request))
+            (rpath / filename).write_bytes(b"not a pickle")
+
+            assert await mw.process_request(self.request) is None
+            assert mw.crawler.stats.get_value("httpcache/retrieve_error") == 1
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
+
+    def test_write_file_leaves_no_temp_file_and_replaces_atomically(self):
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, self.request, self.response)
+            rpath = Path(storage._get_request_path(crawler.spider, self.request))
+            assert not list(rpath.glob("*.tmp"))
+
+            target = rpath / "response_body"
+            storage._write_file(target, b"new body")
+            with storage._open(target, "rb") as f:
+                assert f.read() == b"new body"
+            assert not list(rpath.glob("*.tmp"))
+
+    def test_write_file_keeps_the_old_file_and_cleans_up_on_failure(self):
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, self.request, self.response)
+            rpath = Path(storage._get_request_path(crawler.spider, self.request))
+            target = rpath / "response_body"
+            real_open = storage._open
+
+            def fail_open(path, mode, *args, **kwargs):
+                if mode == "wb":
+                    raise OSError("cannot write")
+                return real_open(path, mode, *args, **kwargs)
+
+            with (
+                mock.patch.object(storage, "_open", side_effect=fail_open),
+                pytest.raises(OSError, match="cannot write"),
+            ):
+                storage._write_file(target, b"new body")
+
+            with storage._open(target, "rb") as f:
+                assert f.read() == self.response.body
+            assert not list(rpath.glob("*.tmp"))
+
+    def test_meta_is_written_last(self):
+        with self._storage() as (storage, crawler):
+            real_write_file = storage._write_file
+            written: list[str] = []
+
+            def record_write_file(path: Path, data: bytes) -> None:
+                written.append(path.name)
+                real_write_file(path, data)
+
+            with mock.patch.object(
+                storage, "_write_file", side_effect=record_write_file
+            ):
+                storage.store_response(crawler.spider, self.request, self.response)
+
+            assert written[-1] == "pickled_meta"
+            assert written[-2] == "meta"
+
     @pytest.mark.parametrize("filename", ["request_headers", "response_headers"])
     def test_storage_header_file(self, filename: str) -> None:
         headers = [
@@ -902,6 +1050,15 @@ class DbmStorageTestMixin(StorageTestMixin):
             k: v for k, v in data.items() if k in ("status", "url", "headers", "body")
         }
         storage.db[f"{key}_data"] = pickle.dumps(data, protocol=4)
+
+    def test_partial_entry_without_data_is_a_miss(self):
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, self.request, self.response)
+            key = storage._fingerprinter.fingerprint(self.request).hex()
+            # Simulate an interrupted write that left the commit time but no
+            # response data.
+            del storage.db[f"{key}_data"]
+            assert storage.retrieve_response(crawler.spider, self.request) is None
 
 
 class TestFilesystemStorageWithDummyPolicy(
@@ -946,6 +1103,25 @@ class TestFilesystemStorageGzipWithDummyPolicy(TestFilesystemStorageWithDummyPol
         # A spider killed while writing a gzip file leaves it truncated.
         body_path = Path(storage._get_request_path(spider, request), "response_body")
         body_path.write_bytes(body_path.read_bytes()[:-5])
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["pickled_meta", "response_body", "response_headers", "response_data"],
+    )
+    @coroutine_test
+    async def test_truncated_gzip_file_is_a_miss(self, filename: str):
+        with self._middleware() as mw:
+            spider = mw.crawler.spider
+            assert spider
+            mw.storage.store_response(spider, self.request, self.response)
+            rpath = Path(mw.storage._get_request_path(spider, self.request))
+            # Truncating the gzip footer leaves small pickles readable, so
+            # corrupt the stream outright, as an interrupted write would.
+            (rpath / filename).write_bytes(b"not a gzip stream")
+
+            assert await mw.process_request(self.request) is None
+            assert mw.crawler.stats.get_value("httpcache/retrieve_error") == 1
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
 
 
 class _LateMiddleware:
@@ -1095,6 +1271,28 @@ class TestConcurrentDownloads(TestBase):
                 await maybe_deferred_to_future(first)
             download.release()
             assert isinstance(await maybe_deferred_to_future(second), Response)
+            assert download.urls == [self.url] * 2
+
+    @coroutine_test
+    async def test_store_failure_makes_waiters_download(self):
+        with self._manager() as (manager, crawler):
+            download = _Downloads()
+            _request, first, second = await self._start(manager, download, crawler)
+            middleware = self._middleware_of(manager, HttpCacheMiddleware)
+            with mock.patch.object(
+                middleware.storage, "store_response", side_effect=OSError("disk full")
+            ):
+                download.release()
+                first_response = await maybe_deferred_to_future(first)
+                second_response = await maybe_deferred_to_future(second)
+
+            assert isinstance(first_response, Response)
+            assert isinstance(second_response, Response)
+            # Both responses attempt to be cached and both fail cleanly.
+            assert crawler.stats.get_value("httpcache/store_error") == 2
+            # Nothing was cached, so the waiter does not read a partial entry and
+            # downloads the resource itself once it is woken up.
+            assert "cached" not in second_response.flags
             assert download.urls == [self.url] * 2
 
     @coroutine_test

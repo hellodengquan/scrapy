@@ -436,6 +436,17 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware`.
 
+.. stat:: httpcache/store_error
+
+``httpcache/store_error``
+    Number of responses that could not be stored in the cache because writing
+    the cache entry failed. The responses are still passed to the spider, and
+    the unwritten entries are treated as cache misses on later requests.
+
+    .. versionadded:: VERSION
+
+    Set by :class:`~scrapy.downloadermiddlewares.httpcache.HttpCacheMiddleware`.
+
 .. stat:: httpcache/uncacheable
 
 ``httpcache/uncacheable``

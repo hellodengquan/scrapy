@@ -514,6 +514,13 @@ Filesystem storage backend (default)
     *   ``pickled_meta`` - the same metadata in ``meta`` but pickled for more
         efficient deserialization
 
+    The files of an entry are written one at a time and each file is replaced
+    atomically, so a crash while writing never leaves a partially written file.
+    The metadata files are written last: an entry without readable metadata is
+    treated as a cache miss, which keeps a half-written entry from being read
+    back. A corrupted entry is likewise treated as a cache miss and replaced by
+    the next complete response stored for the same request.
+
     The directory name is made from the request fingerprint (see
     ``scrapy.utils.request.fingerprint``), and one level of subdirectories is
     used to avoid creating too many files into the same directory (which is
@@ -586,6 +593,11 @@ class, including those of third-party plugins, are cached and restored intact.
     .. method:: store_response(spider, request, response)
 
       Store the given response in the cache.
+
+      If this method raises an exception, e.g. because the disk is full, the
+      middleware logs a warning, counts the failure in
+      :stat:`httpcache/store_error` and keeps processing the response, so a
+      storage failure never prevents a response from reaching the spider.
 
       :param spider: the spider for which the response is intended
       :type spider: :class:`~scrapy.Spider` object
